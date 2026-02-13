@@ -3,6 +3,9 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 from extensions import db
 from models import Usuario
+# importamos funciones para el envio de correos
+from utils.email import enviar_correo_verificacion, enviar_email_bienvenido 
+
 
 # crear el BluePrint (bp)
 auth_bp = Blueprint('auth', __name__, url_prefix='/api/auth')
@@ -36,20 +39,118 @@ def registro():
         nuevo_usuario = Usuario(
             nombre=payload.get('nombre'),
             email=payload.get('email'),
-            password=password_hash
+            password=password_hash,
+            verificado=False
         )
+
+        #  crear el codigo de verificacion
+        codigo = nuevo_usuario.generar_codigo_verificacion()
+
         db.session.add(nuevo_usuario)
         db.session.commit()
 
-        # crear el token
-        access_token = create_access_token(identity=str(nuevo_usuario.id))
+        # enviar el correo
+        correo_enviado = enviar_correo_verificacion(
+            nuevo_usuario.email,
+            nuevo_usuario.nombre,
+            codigo
+        )
+
+        if not correo_enviado:
+            return jsonify({
+                'ok': True,
+                'message': 'El usuairo se creo, pero hubo un error al enviar el email de verificación',
+                'data': nuevo_usuario.to_dict(),
+            }), 201
 
         return jsonify({
             'ok': True,
             'message': 'Usuario creado correctamente',
             'data': nuevo_usuario.to_dict(),
-            'access_token': access_token
         }), 201
+    except Exception as e:
+        return jsonify({'ok': False, 'message': str(e)}), 500
+
+
+
+@auth_bp.route('/verificar-email', methods=['POST'])
+def verificar_email():
+    try:
+        payload = request.get_json()
+
+        if not payload.get('email'):
+            return jsonify({'ok': False, 'message': 'El email es requerido'}), 400
+        if not payload.get('codigo'):
+            return jsonify({'ok': False, 'message': 'El codigo es requerido'}), 400
+
+        # buscar al usuario por correo
+        usuario = Usuario.query.filter_by(email=payload.get('email')).first()
+
+        if not usuario:
+            return jsonify({'ok': False, 'message': 'El usuario no existe'}), 400
+
+        if usuario.verificado:
+            return jsonify({'ok': False, 'message': 'El usuario ya fue verificado!'}), 400
+
+        if not usuario.verificar_codigo(payload.get('codigo')):
+            return jsonify({'ok': False, 'message': 'Codigo expirado o incorrecto!'}), 400
+
+        usuario.verificado = True
+        usuario.codigo_verificacion = None
+        usuario.codigo_expiracion = None
+
+        db.session.commit()
+
+        # enviamos el correo de bienvenida!
+        enviar_email_bienvenido(usuario.nombre)
+
+        access_token = create_access_token(identity=str(usuario.id))
+
+        return jsonify({
+            'ok': True,
+            'message': 'Usuario verificado!',
+            'data': usuario.to_dict(),
+            'access_token': access_token
+        })
+    except Exception as e:
+        return jsonify({'ok': False, 'message': str(e)}), 500
+
+
+@auth_bp.route('/reenviar-codigo', methods=['POST'])
+def reenviar_codigo():
+    try:
+        payload = request.get_json()
+
+        if not payload.get('email'):
+            return jsonify({'ok': False, 'message': 'El email es requerido'}), 400
+
+        usuario = Usuario.query.filter_by(email=payload.get('email')).first()
+
+        if not usuario:
+            return jsonify({'ok': False, 'message': 'El usuario no existe'}), 400
+
+        # verifica si ya esta verificado
+        if usuario.verificado:
+            return jsonify({'ok': False, 'message': 'El usuario ya esta verificado!'})
+
+        # generar un NUEVO codigo
+        codigo = usuario.generar_codigo_verificacion()
+        db.session.commit()
+
+        # enviar el email
+        email_enviado = enviar_correo_verificacion(
+            usuario.email,
+            usuario.nombre,
+            codigo
+        )
+
+        if not email_enviado:
+            return jsonify({'ok': False, 'message': 'Error al enviar el email'}), 500
+
+        return jsonify({
+            'ok': True,
+            'message': 'Codigo enviado exitosamente'
+        })
     except Exception as e:
         return jsonify({'ok': False, 'message': str(e)}), 500
 
